@@ -1,0 +1,591 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h> /* usleep()のため */
+#include <eggx.h>
+
+/************
+ *  macros  *
+ ************/
+#define ELEMENT_SIZE (100) /* 盤の一マスの大きさ */
+#define NUM_OF_ELEMENTS (8) /* 盤の縦、横成分の数 */
+#define FIELD_SIZE (ELEMENT_SIZE * NUM_OF_ELEMENTS)
+#define MESSAGE_SIZE (50) /* 盤面のメッセージ領域の高さ(pixel) */
+#define MAX_MESSAGE (64) /* 盤面のメッセージ領域のメッセージ最大文字数 */
+#define BIG_LOSS (3) /* 3倍以上相手が多ければ，大敗している */
+#define ROTATE_DIRECTION (1) /* 右回り */
+
+/* 色 */
+#define BLACK (0) /* 黒 */
+#define WHITE (1) /* 白 */
+#define GREEN (3) /* 緑 */
+
+/* 要素の状態 */
+#define VACANT (0x00) /* 空き要素 */
+#define WHITE_STONE (0x01) /* 白石が置かれた要素 */
+#define BLACK_STONE (0x02) /* 黒石が置かれた要素 */
+#define STONE_BITS (0x03) /* 石の色を示すビット */
+#define BOUNDARY_BIT (0x04) /* 境界空白を示すビット */
+#define STONE_INVERSION (STONE_BITS) /* XORで石の色を逆転させる */
+#define NUM_OF_DIRECTIONS (8) /* 8つの方向を示す */
+#define MAX_MARGINE (NUM_OF_ELEMENTS * NUM_OF_ELEMENTS)
+
+
+/**************************
+ *  structure definition  *
+ **************************/
+struct location {
+  int row;	/* 行は下から始まり，0から7まで（Y方向）*/
+  int column;	/* 列は左から始まり，0から7まで（X方向） */
+};
+
+struct element {
+  struct location location; /* 要素の位置 */
+  int status; /* 石の有無，石の色，境界となる空き要素か */
+      /*
+       * '0000' 境界でない空き要素
+       * '0100' 境界の空き要素
+       * '0001' 白石が置かれた要素
+       * '0010' 黒石が置かれた要素
+       */
+};
+
+
+
+/***************************
+ *  prototype declaration  *
+ ***************************/
+int count_whiteStones(struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS]);
+int display_situation(int, int, int);
+int isBoundary(int);
+int lookAround_directions(int, struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int);
+int canTurnOver(int, struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int way, int);
+int doesAnyOtherPinch(int, struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int);
+int doesCandidatePinch(struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int);
+int isPinching(struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int, int);
+int place_stone(int, struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int);
+struct element *get_adjacent(struct element [NUM_OF_ELEMENTS][NUM_OF_ELEMENTS], struct element *, int);
+int initialize_element(int, struct element *);
+int paint_element(int, struct element *, int);
+int display_message(int, char *);
+
+
+/***************
+ *  functions  *
+ ***************/
+int
+main()
+{
+    struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS]; /* 盤面のメッシュ */
+    int win; /* 描画用のWindow */
+    int row, column, position; /* 座標を表す */
+    int stone; /* 要素の状態を示す */
+    struct element *element; /* 石を置こうとしている要素のアドレス */
+    int availables; /* 空いているマスの数 */
+    int white_stones; /* 白石の数 */
+    int black_stones; /* 黒石の数 */
+    char buffer[MAX_MESSAGE];
+
+    win = gopen(FIELD_SIZE,FIELD_SIZE + MESSAGE_SIZE);
+    layer(win, 0,1); /* 表示用レイヤを0に，書き込み用レイヤを1に設定．
+			書き込み用レイヤにしか書かないことで描画を速くする */
+    
+    gsetbgcolor(win,"GREEN") ;
+    gclr(win) ; /* 背景色を反映 */
+
+    /* すべての要素を初期化 */
+    for(row = 0; row < NUM_OF_ELEMENTS; row++) {
+      for(column = 0; column < NUM_OF_ELEMENTS; column++) {
+	      element = mesh[row] + column; /* 石を置こうとしている要素のアドレスを指定 */
+	      element->status = VACANT; /* 初期化 */
+	      element->location.row = row; /* 対応付け */
+	      element->location.column = column; /* 対応付け */
+	      initialize_element(win, element); /* 要素の初期化 */
+      }
+    }
+
+    /* 真ん中の４つの要素に白黒の石を置く */
+    column = NUM_OF_ELEMENTS/2 - 1; /* 座標を指定 */
+    row = NUM_OF_ELEMENTS/2 - 1; /* 座標を指定 */
+    element = &mesh[row][column]; /* 左下 */
+    place_stone(win,mesh,element,WHITE_STONE); /* 指定した石を描画 */
+
+    column++; /* 座標を指定 */
+    element = &mesh[row][column]; /* 右下 */
+    place_stone(win,mesh,element,BLACK_STONE); /* 指定した石を描画 */
+
+    row++; /* 座標を指定 */
+    element = &mesh[row][column]; /* 右上 */
+    place_stone(win,mesh,element,WHITE_STONE); /* 指定した石を描画 */
+
+    column--; /* 座標を指定 */
+    element = &mesh[row][column]; /* 左上 */
+    place_stone(win,mesh,element,BLACK_STONE); /* 指定した石を描画 */
+
+    availables = NUM_OF_ELEMENTS * NUM_OF_ELEMENTS - 4; /* ４個は置いたので引いておく */
+    white_stones = 2; /* 初期に描画した白石は２個なので初期値を２に設定 */
+    black_stones = 2; /* 初期に描画した黒石は２個なので初期値を２に設定 */
+    /* 戦況の表示 */
+    display_situation(win, white_stones, black_stones); /* 盤面を再描画 */
+      
+    
+    /* プレーヤの対戦 */
+    stone = BLACK_STONE; /* ゲームは黒石のプレーヤから始まるので初期値設定 */
+    while(availables > 0) { /* ループ文 */
+      if(stone == BLACK_STONE) /* 最初の印字 */
+	      printf("次は黒です．");
+      else
+	      printf("次は白です．"); /* 最初の印字 */
+      printf("どこに置きますか? ");
+      fgets(buffer, MAX_MESSAGE - 1, stdin); /* 石を置きたい座標を入力 */
+      position = atoi(buffer); /* 入力されたものを整数に変換 */
+      row = position / 10; /* 横方向の数字を計算 */
+      column = position % 10; /* 縦方向の数字を計算 */
+      if((row < 0) || (row > NUM_OF_ELEMENTS -1) ||
+	 (column < 0) || (column > NUM_OF_ELEMENTS - 1)) { /* 入力ミスを弾く */
+	      printf("そのようなマスはありません．\n");
+	      continue; /* もう一度ループのはじめに戻る */
+      }
+
+      element = &mesh[row][column];  /* プレーヤが石を置こうとしている要素 */
+      /* この要素は，空白で，かつ，境界（まわりに石が置かれている）かを調べる */
+      if(isBoundary(element->status) == 0) { /* ちがうとき */
+	      printf("ここには置けません．\n"); /* 離島は作れない */
+	      continue; /* ループのはじめに戻る */
+      }
+      
+      /* 置こうとしている要素が相手を挟めず、他に相手の石を挟める要素がある時 */
+      if((doesAnyOtherPinch(win, mesh, element, stone) == 1) &&
+       (doesCandidatePinch(mesh, element, stone) == 0)) {
+	      printf("この位置には置けません. 得点できるマスが他にあります.\n");
+	      continue; /* ループのはじめに戻る */
+      }
+      /* 相手の石を挟める要素がない時 */
+      else if((doesAnyOtherPinch(win, mesh, element, stone) == 0) &&
+       (doesCandidatePinch(mesh, element, stone) == 0)) {
+	      printf("得点できるマスがないため相手に攻撃権を移譲します\n");
+	      stone ^= STONE_INVERSION; /* 白黒反転 */
+	      continue; /* ループのはじめに戻る */
+      }
+
+      /* プレーヤが置いた石が相手の石を挟んでいるか */
+      /* この石の回りのうち，相手の石があるすべての方向で，挟めているかを調べる */
+      /* 挟めていれば，挟んだ相手の石を自分の石に変更 */
+      lookAround_directions(win, mesh, element, stone);
+
+      /* 指定された位置に指定された色の石を置く */
+      place_stone(win,mesh,element,stone); /* この要素に石を置く */
+      availables--; /* 空白を１つ減らす */
+
+      /* 戦況を把握 */
+      white_stones = count_whiteStones(mesh); /* 白石の数を計算 */
+      black_stones = NUM_OF_ELEMENTS * NUM_OF_ELEMENTS - availables - white_stones; /* 黒石の数を計算 */
+
+      /* 戦況の表示 */
+      display_situation(win, white_stones, black_stones);  /* 盤面を再描画 */
+
+      /* どちらかの石が盤上からなくなり勝負が決したらゲームを終了 */
+      if((white_stones == 0) || (black_stones == 0))
+	      break; /* ループ文を抜ける */
+
+      stone ^= STONE_INVERSION; /* 白黒反転 */
+    }
+    printf("終了です．盤面を消します[OK]"); /* 終了の印字 */
+    fgets(buffer, MAX_MESSAGE -1, stdin); /* 入力を受け取り、終了 */
+    
+    gclose(win);
+    return 0;
+}
+
+/*--------------*
+ |  論理レベル  |
+ *--------------*/
+/*******************************
+ *  盤面上の白石の数をカウント *
+ *******************************/
+int
+count_whiteStones(struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS])
+{
+  int count = 0; /* 盤面上の白石の数 */
+  int i, j; /* ループ変数 */
+
+  /* 盤面全体を調査 */
+  for(i = 0; i < NUM_OF_ELEMENTS; i++)
+    for(j = 0; j < NUM_OF_ELEMENTS; j++)
+      if(mesh[i][j].status & WHITE_STONE) /* 白石なら */
+	      count++; /* 数を増やす */
+  return count; /* 白石の数を返す */
+}
+
+/***********************
+ *  盤面上の戦況を表示 *
+ ***********************/
+int
+display_situation(int win, int white, int black)
+{
+  char message[MAX_MESSAGE * 2]; /* メッセージを書き込む領域は大きめに取っておく */
+  char situation[MAX_MESSAGE]; /* 対戦状況 */
+  char *former_cheering = "Good luck, "; /* 前半の応援メッセージ */
+  char *latter_cheering = "! You can still win."; /* 後半の応援メッセージ */
+  int i, j; /* ループ変数 */
+  char *top; /* 応援メッセージの先頭 */
+  char *tail; /* 応援メッセージの最後 */
+  char *loser; /* 負けているプレーヤ */
+  int length; /* 対戦状況と応援メッセージの全体の長さ */
+
+  /* 白石と黒石の盤面上の数の表示 */
+  sprintf(situation, "white: %d,   black: %d   ", white, black); /* 石の数の表示用の文字列作成 */
+  strcpy(message, situation);
+  display_message(win, message); /* ここで盤面を再描画 */
+
+  if(white * BIG_LOSS < black)  loser = "White"; /* 白が大敗していたら */
+  else if(black * BIG_LOSS < white) loser = "Black"; /* 黒が大敗していたら */
+  else loser = NULL; /* どちらも大敗していなかったらNULLにする */
+
+  if(loser != NULL) { /* どちらかが大負けしているならテロップ表示 */
+    for(i = 0; i < 20; i++) { /* 以下を繰り返す */
+      /* sprintf()を使って, message の領域にsituationの内容を書く */
+      sprintf(message, "%s", situation);
+      /* 応援メッセージの先頭 top を message の先頭から situation の長さだけ離れた位置に設定 */
+      top = message + strlen(situation);
+      for(j = 0; j < i; j++) { /* 応援メッセージを右に1文字ずらす */
+	      strcat(top, " ");
+	      top++;
+      }
+      strcat(top, former_cheering);
+      strcat(top, loser);
+      strcat(top, latter_cheering);
+      length = strlen(message);
+      if(length >= MAX_MESSAGE) { /* バッファのサイズを超えたら */
+	      tail = message + MAX_MESSAGE - 1;
+	      *tail = '\0'; /* バッファのサイズ分だけを印字 */
+      }
+      display_message(win, message); /* ここで盤面を再描画 */
+      usleep(100*1000); /* 100ミリ秒実行休止 */
+    }
+  }
+
+  return 0;
+}
+
+/*************************************************
+ *  石を置こうとしている要素は，空白でかつ境界か *
+ *************************************************/
+int
+isBoundary(int status)
+{
+  if((status & STONE_BITS) > 0) { /* 石が置かれている場合 */
+    printf("そのマスには石が置かれています\n");
+    return 0; /* 0を返す */
+  } else if((status & BOUNDARY_BIT) == 0) { /* 周りに石が置かれていない場合 */
+    printf("離れたマスです\n");
+    return 0; /* 0を返す */
+  } else /* 石を置こうとしている要素は，空白でかつ境界なら */
+    return 1; /* 1を返す */
+}
+
+/*******************************************
+ * elementに置かれた石の周りの方向を調べる *
+ *******************************************/
+int
+lookAround_directions(int win, 
+		      struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+		      struct element *element,
+		      int stone)
+{
+  int way; /* 方向 */
+  int adjacent_stone; /* 隣の石 */
+  struct element *adjacent; /* 隣接する要素 */
+  int result = 0; /* 挟んでいる方向の数 */
+
+  /* すべての方向で */
+  for(way = 0; way < NUM_OF_DIRECTIONS; way++) {
+    /* 1つの方向で調べる */
+    adjacent = get_adjacent(mesh, element, way); /* 隣接要素の位置 */
+    if(adjacent == NULL) continue; /* 隣の要素が盤の外なら，次の方向へ */
+
+    adjacent_stone = adjacent->status & STONE_BITS; /* 隣の石 */
+    if(adjacent_stone == VACANT) /* 隣が空きなら */
+      continue; /* 何もしない*/
+    else if(adjacent_stone ^ stone) { /* 相手の石なら */
+      /* 相手の石を挟んでいるか調査 */
+      if(canTurnOver(win, mesh, adjacent, way, stone) == 1) {
+	      place_stone(win,mesh,adjacent, stone); /* 隣の石を自分の色へ */
+	      result++; /* 挟んでいる方向を1つ増やす */
+      }
+    }
+  }
+
+  return result; /* 挟んでいる方向の数を返す */
+}
+
+/***********************************************
+ * 指定された方向でelement上の石を獲得できるか *
+ ***********************************************/
+int
+canTurnOver(int win, 
+	    struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+	    struct element *element,
+	    int way,
+	    int stone) /* この色の石で element にある石を挟む */
+{
+  struct element *adjacent; /* 隣接する要素 */
+
+  adjacent = get_adjacent(mesh, element, way); /* 隣接要素の位置 */
+  if(adjacent == NULL)
+    return 0; /* 隣の要素が盤の外なら，挟んでいないと報告し調査終了 */
+
+  if((adjacent->status & STONE_BITS) == VACANT) { /* 空き要素ならば */
+    return 0; /* 挟んでいないと報告し調査終了 */
+  } else if((adjacent->status & STONE_BITS) == stone) { /* 自分の石の色なら */
+    place_stone(win, mesh, element, stone); /* この石を自分の色に */
+    return 1; /* 挟んでいると報告し調査終了 */
+  } else { /* 相手の石なら */
+    /* さらに調査 */
+    if(canTurnOver(win, mesh, adjacent, way, stone)) { /* 挟んでいるなら */
+      place_stone(win, mesh, element, stone); /* この石を自分の色に */
+      return 1; /* 挟んでいると報告し調査終了 */
+    } else /* 挟んでいないなら */
+      return 0;  /* 挟んでいないと報告し調査終了 */
+  }
+}
+  
+/**********************************
+ *  他の要素が相手の石を挟めるか  *
+ **********************************/
+int
+doesAnyOtherPinch(int win,
+		  struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+		  struct element *element, /* この要素以外で探す */
+		  int stone)
+{
+  int i, j; /* ループ変数 */
+  struct element *candidate; /* 挟む可能性のある候補要素 */
+
+  /* 盤面上のすべての要素を調べる */
+  for(i = 0; i < NUM_OF_ELEMENTS; i++) {
+    for(j = 0; j < NUM_OF_ELEMENTS; j++) {
+      /* 石を置こうとしている要素 */
+      if((i == element->location.row) && (j == element->location.column))
+	      continue; /* この要素以外で */
+      candidate = &mesh[i][j]; /* アドレスを渡す */
+      if(candidate->status & BOUNDARY_BIT) { /* 境界の空白要素なら */
+        /* 候補要素が相手の石を挟めるなら */
+	      if(doesCandidatePinch(mesh, candidate, stone) == 1)
+	        return 1; /* 他の要素が相手の石を挟めると報告し調査終了 */
+      }
+    }
+  }
+  return 0; /* 他の要素が相手の石を挟めないと報告し調査終了 */
+}
+
+/**********************************
+ *  候補要素が相手の石を挟めるか  *
+ **********************************/
+int
+doesCandidatePinch(struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+		   struct element *candidate, /* この要素が相手を挟むか */
+		   int stone)
+{
+  int way; /* 方向 */
+  struct element *adjacent; /* 候補要素に隣接する要素 */
+
+  /* すべての方向で */
+  for(way = 0; way < NUM_OF_DIRECTIONS; way++) {
+    /* 1つの方向で調べる */
+    adjacent = get_adjacent(mesh, candidate, way); /* 隣接要素の位置 */
+    if(adjacent == NULL) continue; /* 隣の要素が盤の外なら，次の方向へ */
+
+    if((adjacent->status & STONE_BITS) == VACANT) /* 空き要素ならば */
+      continue;
+    else if((adjacent->status & STONE_BITS) ^ stone) { /* 相手の石なら */
+      /* 相手の石を挟んでいるか調査 */
+      if(isPinching(mesh, adjacent, way, stone) == 1) {
+	      return 1; /* 相手の石を挟んでいると報告し調査終了 */
+      }
+    }
+  }
+
+  return 0; /* 候補要素が相手の石をを挟めないと報告し調査終了 */
+}
+
+  
+/*******************************************
+ *  指定された方向で相手の石を挟んでいるか *
+ *******************************************/
+int
+isPinching(struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+	   struct element *element,
+	   int way,
+	   int stone) /* この色の石で element にある石を挟む */
+{
+  struct element *adjacent; /* 隣接する要素 */
+
+  adjacent = get_adjacent(mesh, element, way); /* 隣接要素の位置 */
+  if(adjacent == NULL)
+    return 0; /* 隣の要素が盤の外なら，挟んでいないと報告し調査終了 */
+
+  if((adjacent->status & STONE_BITS) == VACANT) { /* 空き要素ならば(盤外でも空きと判定される) */
+    return 0; /* 挟んでいないと報告し調査終了 */
+  } else if((adjacent->status & STONE_BITS) == stone) { /* 自分の石の色なら */
+    return 1; /* 挟んでいると報告し調査終了 */
+  } else { /* 相手の石なら */
+    /* さらに調査 */
+    return isPinching(mesh, adjacent, way, stone);
+  }
+}
+  
+
+/******************************
+ *  指定された要素に石を置く  *
+ ******************************/
+int
+place_stone(int win,
+	    struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+	    struct element *element,
+	    int stone)
+{
+  int way; /* 方向 */
+  struct element *adjacent; /* 隣接する要素 */
+  int color; /* 色 */
+  
+  element->status = stone; /* 石の状態を代入 */
+
+  if(stone == WHITE_STONE)
+    color = WHITE; /* 置く石が白ならcolorを白色に設定 */
+  else
+    color = BLACK; /* 置く石が黒ならcolorを黒色に設定 */
+  paint_element(win, element, color); /* この要素の石の色を変更 */
+
+  /* 隣接要素の設定 */
+  for(way = 0; way < NUM_OF_DIRECTIONS; way++) {
+    adjacent = get_adjacent(mesh, element, way); /* 隣接要素の位置 */
+    if(adjacent == NULL) continue; /* 隣接要素がなければ何もしない */
+
+    /* 隣接要素が境界空白要素になったら，その旨，statusに示す．*/
+    if(adjacent->status == VACANT)
+      adjacent->status = BOUNDARY_BIT;
+  }
+  
+  return 0;
+}
+
+/******************************
+ *  指定された要素の隣の要素  *
+ ******************************/
+struct element *
+get_adjacent(struct element mesh[NUM_OF_ELEMENTS][NUM_OF_ELEMENTS],
+	     struct element *element,
+	     int way)
+{
+  struct element *adjacent; /* 隣接する要素 */
+  int row, column; /* 位置を表す変数 */
+  int row_vector, column_vector; /* 隣接位置を表す変数 */
+  
+  /* 隣接要素の設定 */
+  switch(way) { /* 隣接要素の位置計算 */
+  case 0: row_vector = 1; column_vector = 0; break;
+  case 1: row_vector = 1; column_vector = 1; break;
+  case 2: row_vector = 0; column_vector = 1; break;
+  case 3: row_vector = -1; column_vector = 1; break;
+  case 4: row_vector = -1; column_vector = 0;  break;
+  case 5: row_vector = -1; column_vector = -1; break;
+  case 6: row_vector = 0; column_vector = -1; break;
+  case 7: row_vector = 1; column_vector = -1; break;
+  default: break;
+  }
+  /* 隣接要素の位置 */
+  row = element->location.row + row_vector;
+  column = element->location.column + column_vector;
+
+  if((row < 0) || (row > NUM_OF_ELEMENTS - 1)) /* 盤外なら */
+    return (struct element *)NULL; /* 隣接要素がなければNULLを返す */
+  if((column < 0) || (column > NUM_OF_ELEMENTS - 1)) /* 盤外なら */
+    return (struct element *)NULL; /* 隣接要素がなければNULLを返す */
+
+  adjacent = mesh[row] + column; /* 隣の要素のアドレス */
+  return adjacent; /* 指定された要素の隣の要素を返す */
+}
+
+
+/*--------------*
+ |  物理レベル  |
+ *--------------*/
+/*****************
+ *  要素を初期化 *
+ *****************/
+int initialize_element(int win, struct element *element)
+{
+  float x, y; /* 座標を表す変数 */
+  float edge=0; /* 長さ */
+  int row = element->location.row; /* rowを設定 */
+  int column = element->location.column; /* columnを設定 */
+
+  x = column * (float)ELEMENT_SIZE; /* 要素の左下の座標 */
+  y = row * (float)ELEMENT_SIZE;
+
+  newpen(win, BLACK); /* 色を変える */
+  edge = (float)ELEMENT_SIZE; /* 一辺の長さを設定 */
+  drawrect(win,x,y, edge, edge); /* 正方形を描く */
+
+  drawstr(win, x+1, y+1, 8, 0.0, "%d%d",row, column); /* 数字を描く */
+
+  return 0;
+}
+
+/**********************************
+ *  指定された要素の石に色を塗る  *
+ **********************************/
+int paint_element(int win, struct element *element, int color)
+{
+  float x, y; /* 座標を表す変数 */
+  float center_x=0, center_y=0; /* 図形の真ん中の座標を表す変数 */
+  float edge=(float )ELEMENT_SIZE; /* 長さを設定 */
+  float radian; /* 角度 */
+  float start_angle = 0.0; /* はじまりの角度 */
+  float end_angle = 0.0; /* 終わりの角度 */
+  int row = element->location.row; /* rowを設定 */
+  int column = element->location.column; /* columnを設定 */
+
+  x = column * (float)ELEMENT_SIZE; /* 要素の左下の座標 */
+  y = row * (float)ELEMENT_SIZE;
+
+  newpen(win, color); /* 色を変える */
+  center_x = x + edge/2.0; center_y = y + edge/2.0; /* 真ん中の位置を設定 */
+  radian = edge/2.0 - 1; /* 角度を設定 */
+  start_angle = 0.0; end_angle = 360.0; /* どれだけ描くか設定 */
+  fillarc(win, center_x, center_y, radian, radian,
+	  start_angle, end_angle, ROTATE_DIRECTION); /* 円を塗る */
+
+  return 0;
+}
+
+/***************************
+ *  盤面上のメッセージ表示 *
+ ***************************/
+int
+display_message(int win,
+		char *message)
+{
+  float x, y; /* 座標を表す変数 */
+
+  x = 0; /* 盤面の左側 */
+  y = (float)ELEMENT_SIZE * NUM_OF_ELEMENTS; /* 盤面の上側 */
+
+  newpen(win, GREEN); /* 前の文字列を消す */
+  fillrect(win, x, y, ELEMENT_SIZE * NUM_OF_ELEMENTS, MESSAGE_SIZE);
+
+  newpen(win, BLACK); /* 色を変える */
+  drawrect(win, x, y, ELEMENT_SIZE * NUM_OF_ELEMENTS, MESSAGE_SIZE);
+
+  x += (float)ELEMENT_SIZE / 2;
+  y += (float)MESSAGE_SIZE / 3;
+  drawstr(win, x, y, 16, 0.0, "%s", message); /* メッセージを描く */
+
+  copylayer(win, 1, 0); /* 書き込み用レイヤから表示用レイヤに一気にコピー
+			   これで描画を速くする */
+
+  return 0;
+}
+
